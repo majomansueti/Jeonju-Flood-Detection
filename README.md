@@ -19,7 +19,6 @@ By leveraging the free computing power of GEE and generating localized Anteceden
 ## Repository Structure
 
 ```
-.
 ├── Flood/
 │   ├── images/                 # Output screenshots and supplementary maps
 │   └── requirements.txt        # Python dependencies
