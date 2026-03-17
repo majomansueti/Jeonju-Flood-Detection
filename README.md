@@ -66,5 +66,3 @@ Water surfaces act as specular reflectors, dropping the radar backscatter signif
 ## Validation (Jeonju, July 2023)
 The pipeline correctly detected 4.23 km² of inundated land during the July 15-20 weather event, primarily concentrated along the Jeonjucheon river corridor. A threshold of $\Delta$dB = 1.5 dB was optimized to achieve an **F1-Score of 0.78**.
 
-## License
-MIT License
