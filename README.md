@@ -24,7 +24,6 @@ By leveraging the free computing power of GEE and generating localized Anteceden
 ├── docs/                  # KIICE Research Paper and Presentation Slides
 ├── images/                # Output screenshots and supplementary maps
 ├── notebooks/             # Original interactive analysis notebook
-├── src/                   # Python source code for the automated pipeline
 ├── requirements.txt       # Python dependencies
 └── README.md
 ```
