@@ -1,0 +1,851 @@
+# - Flood Map —
+# Builds an interactive Earth Engine flood map for Jeonju:
+# loads rainfall, terrain, and Sentinel-1 SAR, creates a flood mask,
+# shows everything on a map with sliders, checks which heritage/shelter
+# points are flooded, and exports polygons + points to Google Drive.
+
+
+!pip install -q earthengine-api==0.1.390 geemap folium==0.15.1 ipywidgets
+
+import os
+import ee, geemap, folium, ipywidgets as widgets
+
+EE_PROJECT_ID = "flood-maps-472200"   #  Earth Engine project
+
+# clear conflicting env vars
+for var in ['EE_PROJECT','EE_CLOUD_PROJECT','EARTHENGINE_PROJECT','GOOGLE_CLOUD_PROJECT','EE_ACCOUNT']:
+    if var in os.environ:
+        del os.environ[var]
+
+# init EE with your project
+try:
+    ee.Initialize(project=EE_PROJECT_ID)
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=EE_PROJECT_ID)
+
+# ===== USER SETTINGS =====
+AOI_NAME = "SUMATRA"        # "JEONJU" (Korea) or "RIMAC" (Peru) it can change to other cities.
+EVENT_START = "2025-11-17"
+EVENT_END   = "2025-11-27"
+AP_HOURS    = [6, 24, 72]
+DELTA_DB_INIT = 1.5
+
+# modest AOIs to avoid payload limits
+AOIS = {
+    "JEONJU": {"bbox": [127.08, 35.79, 127.17, 35.88], "center": [35.835, 127.125], "zoom": 12},
+    "RIMAC":  {"bbox": [-76.85, -11.96, -76.70, -11.82], "center": [-11.89, -76.77], "zoom": 11},
+    "SUMATRA": {"bbox": [100.30, -1.00, 100.45, -0.85], "center": [-0.925, 100.375], "zoom": 12},  # Padang City
+}
+if AOI_NAME not in AOIS:
+    raise ValueError(f"AOI_NAME must be one of {list(AOIS.keys())}")
+aoi_info = AOIS[AOI_NAME]
+aoi = ee.Geometry.Rectangle(aoi_info["bbox"])
+
+# ===== IMERG v07 (normalize to 'precip' band) =====
+IMERG_raw = (ee.ImageCollection('NASA/GPM_L3/IMERG_V07')
+             .filterBounds(aoi)
+             .filterDate(ee.Date(EVENT_START).advance(-10,'day'), ee.Date(EVENT_END)))
+
+def normalize_imerge(img):
+    # Some images have 'precipitationCal', others just 'precipitation'
+    bnames = img.bandNames()
+    has_cal  = bnames.contains('precipitationCal')
+    has_prec = bnames.contains('precipitation')
+    precip = ee.Image(ee.Algorithms.If(
+        has_cal,  img.select('precipitationCal'),
+        ee.Algorithms.If(has_prec, img.select('precipitation'),
+                         img.select(bnames.get(0)))   # rare fallback
+    ))
+    return precip.rename('precip').copyProperties(img, img.propertyNames())
+
+IMERG = IMERG_raw.map(normalize_imerge)
+
+# DEM
+SRTM = ee.Image('USGS/SRTMGL1_003')
+
+# ----- helpers -----
+def to_db(img):
+    return ee.Image(10).multiply(img.log10()).rename(img.bandNames())
+
+def sum_hours(hours):
+    # IMERG is half-hourly rate (mm/hr). Sum and multiply by 0.5h to get mm.
+    start = ee.Date(EVENT_START).advance(-hours, 'hour')
+    return (IMERG.filterDate(start, ee.Date(EVENT_START))
+            .select('precip')
+            .sum()
+            .multiply(0.5)
+            .rename(f'R{hours}h'))
+
+def find_nearest_s1_vv(aoi, date_start, date_end, expand_days_list=(0,15,30,60,90)):
+    S1 = (ee.ImageCollection('COPERNICUS/S1_GRD')
+          .filterBounds(aoi)
+          .filter(ee.Filter.eq('instrumentMode','IW'))
+          .filter(ee.Filter.eq('productType','GRD'))
+          .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VV')))
+
+    found_pre = None; found_post = None
+    used_pre_range = None; used_post_range = None
+
+    # pre window search
+    for days in expand_days_list:
+        pre_start = ee.Date(date_start).advance(-days, 'day').advance(-30, 'day')
+        pre_end   = ee.Date(date_start)
+        coll = S1.filterDate(pre_start, pre_end)
+        if coll.size().getInfo() > 0:
+            found_pre = coll.mosaic().select('VV')
+            used_pre_range = (pre_start.format('YYYY-MM-dd').getInfo(), pre_end.format('YYYY-MM-dd').getInfo())
+            break
+
+    # post window search
+    for days in expand_days_list:
+        post_start = ee.Date(date_start)
+        post_end   = ee.Date(date_end).advance(days, 'day')
+        coll = S1.filterDate(post_start, post_end)
+        if coll.size().getInfo() > 0:
+            found_post = coll.mosaic().select('VV')
+            used_post_range = (post_start.format('YYYY-MM-dd').getInfo(), post_end.format('YYYY-MM-dd').getInfo())
+            break
+
+    return found_pre, found_post, used_pre_range, used_post_range
+
+# ===== features (rain + terrain) =====
+Rimgs = [sum_hours(h) for h in AP_HOURS]
+stack_rain = ee.Image.cat(Rimgs)  # R6h, R24h, R72h
+API = stack_rain.expression(
+    '0.6*R6 + 0.3*R24 + 0.1*R72',
+    {'R6': stack_rain.select('R6h'),
+     'R24': stack_rain.select('R24h'),
+     'R72': stack_rain.select('R72h')}
+).rename('API')
+slope  = ee.Terrain.slope(SRTM).rename('slope')
+aspect = ee.Terrain.aspect(SRTM).rename('aspect')
+feat_stack = ee.Image.cat([API, stack_rain, slope, aspect]).clip(aoi)
+
+# ===== Sentinel-1 =====
+pre_vv, post_vv, pre_rng, post_rng = find_nearest_s1_vv(aoi, EVENT_START, EVENT_END)
+
+sar_available = (pre_vv is not None) and (post_vv is not None)
+if sar_available:
+    pre_db  = to_db(pre_vv).rename(['VV_pre'])
+    post_db = to_db(post_vv).rename(['VV_post'])
+    dVV = post_db.select('VV_post').subtract(pre_db.select('VV_pre')).rename('dVV')
+    feat_stack = feat_stack.addBands(dVV)
+else:
+    dVV = ee.Image.constant(0).rename('dVV').clip(aoi)
+
+# ===== interactive map =====
+def render_map(delta_db=DELTA_DB_INIT):
+    m = geemap.Map(center=aoi_info["center"], zoom=aoi_info["zoom"])
+    m.addLayer(feat_stack.select('API'), {'min':0,'max':200}, 'API (mm, weighted 6/24/72h)')
+    m.addLayer(feat_stack.select('R6h'),  {'min':0,'max':100}, 'Rain 6h (mm)', False)
+    m.addLayer(feat_stack.select('R24h'), {'min':0,'max':200}, 'Rain 24h (mm)', False)
+    m.addLayer(feat_stack.select('R72h'), {'min':0,'max':400}, 'Rain 72h (mm)', False)
+    m.addLayer(slope, {'min':0,'max':60}, 'Slope (deg)', False)
+
+    if sar_available:
+        m.addLayer(dVV, {'min':-5,'max':5,
+                         'palette':['#08306b','#2171b5','#6baed6','#bdd7e7','#fee0d2','#fc9272','#de2d26']},
+                   'Sentinel-1 dVV (post-pre, dB)', False)
+        flood = dVV.lt(ee.Number(-abs(delta_db))).selfMask().rename('flood')
+        m.addLayer(flood, {'palette':['#0000FF']}, f'Flood mask (dVV < {-abs(delta_db):.1f} dB)')
+        pre_txt  = f"{pre_rng[0]} → {pre_rng[1]}"
+        post_txt = f"{post_rng[0]} → {post_rng[1]}"
+        note = f"<b>SAR windows</b> — pre: {pre_txt} | post: {post_txt}"
+    else:
+        note = ("<b>SAR not found</b> near your dates (even after expanding). "
+                "Try adjusting EVENT_START/END or switch AOI.")
+
+    m.addLayerControl()
+    display(widgets.HTML(
+        f"<div style='font-family:ui-sans-serif;line-height:1.4;margin:6px 0'>"
+        f"<b>AOI:</b> {AOI_NAME} &nbsp; | &nbsp; <b>Event:</b> {EVENT_START} → {EVENT_END}<br>"
+        f"{note}<br>"
+        f"<b>Tip:</b> More false positives? raise |ΔdB|. Missed floods? lower it."
+        f"</div>"
+    ))
+    return m
+
+delta_slider = widgets.FloatSlider(value=DELTA_DB_INIT, min=0.5, max=3.0, step=0.1,
+                                   readout=True, description='ΔdB:', continuous_update=False)
+out = widgets.Output()
+def on_change(change):
+    if change['name'] == 'value':
+        with out:
+            out.clear_output(wait=True)
+            display(render_map(delta_slider.value))
+delta_slider.observe(on_change, names='value')
+
+display(widgets.HTML("<h3 style='font-family:ui-sans-serif'>🌧️ Interactive SAR Flood Map</h3>"))
+display(delta_slider)
+with out:
+    display(render_map(delta_slider.value))
+display(out)
+
+
+# === Cell 1: Setup (pip installs) ===
+!pip -q install rasterio numpy pillow matplotlib geopandas shapely pandas
+
+
+# === Cell 4A (fixed): robust Jeonju heritage CSV with proper viewbox ===
+!pip -q install geopy pandas
+
+import time
+import pandas as pd
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+
+# Sites (EN + KR variants)
+PLACES = [
+    {"name":"Jeonju Hanok Village",               "alt":["전주한옥마을"]},
+    {"name":"Gyeonggijeon Shrine",                "alt":["경기전"]},
+    {"name":"Jeondong Catholic Cathedral",        "alt":["전동성당"]},
+    {"name":"Pungnammun Gate",                    "alt":["풍남문"]},
+    {"name":"Jeonju Hyanggyo (Confucian School)", "alt":["전주향교"]},
+    {"name":"Omokdae and Imokdae",                "alt":["오목대와 이목대","오목대","이목대"]},
+    {"name":"Pungpaejigwan Guesthouse",           "alt":["풍패지관"]},
+    {"name":"Jeonju Traditional Crafts Museum",   "alt":["전주전통공예관"]},
+    {"name":"Hyanggyo Ginkgo Road",               "alt":["전주향교 은행나무길","은행나무길 전주향교"]},
+    {"name":"Nambu Market Night Market",          "alt":["전주남부시장 야시장","전주 남부시장"]},
+]
+
+# Proper viewbox format for geopy/Nominatim: ((south, west), (north, east))
+VIEWBOX = ((35.76, 127.05), (35.88, 127.30))  # Jeonju approx bbox
+
+geolocator = Nominatim(user_agent="jeonju-heritage-geocoder")
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
+
+def try_geocode_one(base_name, city_hint="Jeonju, South Korea", alt_list=None):
+    queries = [f"{base_name}, {city_hint}"]
+    if alt_list:
+        queries += [f"{alt}, {city_hint}" for alt in alt_list]
+    queries += [base_name] + (alt_list or [])
+
+    for q in queries:
+        # pass viewbox as tuple-of-tuples; use bounded=True (bool, not 1)
+        loc = geocode(q, addressdetails=False, country_codes="kr", viewbox=VIEWBOX, bounded=True)
+        if loc:
+            return loc
+        time.sleep(0.8)
+    return None
+
+rows = []
+for p in PLACES:
+    name = p["name"]
+    alts = p.get("alt", [])
+    loc = try_geocode_one(name, alt_list=alts)
+    if loc:
+        rows.append({"name": name, "lat": loc.latitude, "lon": loc.longitude, "note": ""})
+    else:
+        rows.append({"name": name, "lat": None, "lon": None, "note": "geocode_failed"})
+
+df = pd.DataFrame(rows, columns=["name","lat","lon","note"])
+
+# Fallback coordinates (approx) if geocode still fails
+FALLBACK = {
+    "Jeonju Hanok Village":               (35.81518, 127.15389),
+    "Gyeonggijeon Shrine":                (35.81524, 127.14993),
+    "Jeondong Catholic Cathedral":        (35.81462, 127.14959),
+    "Pungnammun Gate":                    (35.81393, 127.14965),
+    "Jeonju Hyanggyo (Confucian School)": (35.82803, 127.15829),
+    "Omokdae and Imokdae":                (35.81595, 127.15445),
+    "Pungpaejigwan Guesthouse":           (35.82155, 127.14830),
+    "Jeonju Traditional Crafts Museum":   (35.81561, 127.15203),
+    "Hyanggyo Ginkgo Road":               (35.82775, 127.15805),
+    "Nambu Market Night Market":          (35.81247, 127.14796),
+}
+
+for i, r in df.iterrows():
+    if pd.isna(r["lat"]) or pd.isna(r["lon"]):
+        key = r["name"]
+        if key in FALLBACK:
+            lat, lon = FALLBACK[key]
+            df.at[i, "lat"] = lat
+            df.at[i, "lon"] = lon
+            note = r["note"] if isinstance(r["note"], str) else ""
+            df.at[i, "note"] = (note + "; fallback").strip("; ")
+
+df.to_csv("heritage_sites.csv", index=False, encoding="utf-8")
+print("Wrote heritage_sites.csv")
+df
+
+
+# --- PREREQS: AOI, API, flood_mask, DEM, slope, heritage FeatureCollection (HERITAGE_FC) exist ---
+
+# Define flood_mask based on previously calculated dVV and DELTA_DB_INIT
+flood_mask = dVV.lt(ee.Number(-abs(DELTA_DB_INIT))).selfMask().rename('flood_mask')
+
+# Define FSI (Flood Susceptibility Index) based on API and slope
+FSI = (API.divide(50).add(slope.lt(5).multiply(3))).rename('fsi')
+
+# Create ee.FeatureCollection for heritage points from sites_df
+features = []
+for index, row in df.iterrows():
+    point = ee.Geometry.Point([row['lon'], row['lat']])
+    features.append(ee.Feature(point, {'name': row['name']}))
+HERITAGE_FC = ee.FeatureCollection(features)
+
+folder = 'KFloodNet_Exports'   # will appear in your Google Drive
+scale_api = 100                # meters/pixel (API smooth)
+scale_flood = 30               # Sentinel-1 native-ish
+scale_dem = 30
+
+# 1) API (mm)
+ee.batch.Export.image.toDrive(
+    image=API.float(),
+    description='jeonju_api_mm',
+    folder=folder,
+    fileNamePrefix='jeonju_api_mm',
+    region=aoi, scale=scale_api, maxPixels=1e13
+).start()
+
+# 2) Flood mask (1 = flood, masked elsewhere)
+ee.batch.Export.image.toDrive(
+    image=flood_mask.uint8(),
+    description='jeonju_flood_mask',
+    folder=folder,
+    fileNamePrefix='jeonju_flood_mask',
+    region=aoi, scale=scale_flood, maxPixels=1e13
+).start()
+
+# 3) DEM & Slope
+ee.batch.Export.image.toDrive(
+    image=SRTM.rename('elev').float(), # Using SRTM as DEM
+    description='jeonju_dem',
+    folder=folder,
+    fileNamePrefix='jeonju_dem',
+    region=aoi, scale=scale_dem, maxPixels=1e13
+).start()
+
+ee.batch.Export.image.toDrive(
+    image=slope.rename('slope_deg').float(),
+    description='jeonju_slope_deg',
+    folder=folder,
+    fileNamePrefix='jeonju_slope_deg',
+    region=aoi, scale=scale_dem, maxPixels=1e13
+).start()
+
+# 4) FSI (susceptibility index; optional but useful)
+ee.batch.Export.image.toDrive(
+    image=FSI.float(),
+    description='jeonju_fsi',
+    folder=folder,
+    fileNamePrefix='jeonju_fsi',
+    region=aoi, scale=scale_api, maxPixels=1e13
+).start()
+
+# 5) Heritage points (CSV)
+ee.batch.Export.table.toDrive(
+    collection=HERITAGE_FC,
+    description='jeonju_heritage_points',
+    folder=folder,
+    fileNamePrefix='jeonju_heritage_points',
+    fileFormat='CSV'
+).start()
+
+flood_mask = dVV.lt(ee.Number(-abs(DELTA_DB_INIT))).selfMask().rename('flood_mask')
+
+
+# ========= EE → Kepler exports =========
+# Uses existing variables from your notebook:
+#   aoi, flood_mask (binary image), HERITAGE_FC (points FeatureCollection)
+# Keeps your Drive folder name:
+folder = 'KFloodNet_Exports'  # change if you want
+scale_flood = 30              # S1 native-ish (m)
+
+# 1) Clean the flood mask (remove tiny speckles) and vectorize to polygons
+flood_clean = (flood_mask
+               .connectedPixelCount(8).gte(4)   # keep blobs ≥4 pixels
+               .selfMask())
+
+flood_polys = flood_clean.reduceToVectors(
+    geometry=aoi,
+    scale=scale_flood,
+    geometryType='polygon',
+    labelProperty='flood',       # will be 1 for flooded polygons
+    eightConnected=True,
+    maxPixels=1e13,
+    bestEffort=True,
+    tileScale=4
+)
+
+# Add area (m²) to each polygon — handy for filtering/styling in Kepler
+flood_polys = flood_polys.map(lambda f: f.set({'area_m2': f.geometry().area(1)}))
+
+# Optional: drop tiny polygons by area (e.g., < 900 m² ~ 1 pixel @30m is 900 m²)
+min_area = 900
+flood_polys = flood_polys.filter(ee.Filter.gte('area_m2', min_area))
+
+# 2) Export flood polygons as GeoJSON (Kepler loves this)
+ee.batch.Export.table.toDrive(
+    collection=flood_polys,
+    description='jeonju_flood_polys',
+    folder=folder,
+    fileNamePrefix='jeonju_flood_polys',
+    fileFormat='GeoJSON'
+).start()
+
+# 3) Export heritage points (CSV) — your notebook already writes this FC + CSV,
+# but here’s a clean EE export to Drive as well:
+ee.batch.Export.table.toDrive(
+    collection=HERITAGE_FC,
+    description='jeonju_heritage_points',
+    folder=folder,
+    fileNamePrefix='jeonju_heritage_points',
+    fileFormat='CSV'
+).start()
+
+print("Started Drive exports: flood polygons (GeoJSON) + heritage points (CSV).")
+print("Drive > My Drive > KFloodNet_Exports (default).")
+
+
+# Padang City Flash Flood Analysis - November 2025
+# Environmental assessment: deforestation, soil degradation, river systems, ecosystem impacts
+
+!pip install -q earthengine-api==0.1.390 geemap folium==0.15.1 ipywidgets
+
+import os
+import ee, geemap, ipywidgets as widgets
+from IPython.display import display, HTML
+
+EE_PROJECT_ID = "flood-maps-472200"
+
+# Clear conflicting env vars
+for var in ['EE_PROJECT','EE_CLOUD_PROJECT','EARTHENGINE_PROJECT','GOOGLE_CLOUD_PROJECT','EE_ACCOUNT']:
+    if var in os.environ:
+        del os.environ[var]
+
+# Initialize Earth Engine
+try:
+    ee.Initialize(project=EE_PROJECT_ID)
+    print("✓ Earth Engine initialized")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=EE_PROJECT_ID)
+    print("✓ Earth Engine authenticated and initialized")
+
+# ===== EVENT CONFIGURATION =====
+print("\n🌧️ Configuring Padang City flood event...")
+AOI_NAME = "PADANG"
+EVENT_START = "2025-11-19"  # 37mm rainfall day
+EVENT_END = "2025-11-27"    # 145mm rainfall peak
+POST_EVENT = "2025-12-01"   # 4 days after
+
+# Area of Interest: Padang City + upstream watersheds
+AOIS = {
+    "PADANG": {
+        "bbox": [100.25, -1.05, 100.45, -0.80],
+        "center": [-0.925, 100.35],
+        "zoom": 11,
+        "rivers": {
+            "Batang Kuranji": [[100.30, -0.98], [100.35, -0.95], [100.38, -0.93], [100.40, -0.92]],
+            "Batang Aie Dingin": [[100.28, -0.96], [100.33, -0.93], [100.36, -0.91], [100.38, -0.90]]
+        }
+    }
+}
+
+aoi_info = AOIS[AOI_NAME]
+aoi = ee.Geometry.Rectangle(aoi_info["bbox"])
+upstream_zone = ee.Geometry.Rectangle([100.28, -1.00, 100.35, -0.90])
+
+print(f"AOI: {aoi_info['bbox']}")
+print(f"Event period: {EVENT_START} to {EVENT_END}")
+
+# ===== DATA COLLECTION =====
+
+# 1. RAINFALL - IMERG v07
+print("\n📡 Loading rainfall data (IMERG)...")
+IMERG_raw = (ee.ImageCollection('NASA/GPM_L3/IMERG_V07')
+             .filterBounds(aoi)
+             .filterDate(ee.Date(EVENT_START).advance(-10,'day'), ee.Date(POST_EVENT)))
+
+def normalize_imerg(img):
+    bnames = img.bandNames()
+    has_cal = bnames.contains('precipitationCal')
+    has_prec = bnames.contains('precipitation')
+    precip = ee.Image(ee.Algorithms.If(
+        has_cal, img.select('precipitationCal'),
+        ee.Algorithms.If(has_prec, img.select('precipitation'),
+                         img.select(bnames.get(0)))
+    ))
+    return precip.rename('precip').copyProperties(img, img.propertyNames())
+
+IMERG = IMERG_raw.map(normalize_imerg)
+print(f"✓ IMERG collection loaded: {IMERG.size().getInfo()} images")
+
+# 2. TERRAIN
+print("🏔️ Loading terrain data (SRTM)...")
+SRTM = ee.Image('USGS/SRTMGL1_003').clip(aoi)
+elevation = SRTM.select('elevation')
+slope = ee.Terrain.slope(SRTM).rename('slope')
+aspect = ee.Terrain.aspect(SRTM).rename('aspect')
+print("✓ Terrain data loaded")
+
+# 3. FOREST COVER
+print("🌲 Loading deforestation data (Hansen)...")
+forest_dataset = ee.Image('UMD/hansen/global_forest_change_2023_v1_11')
+forest_cover_2000 = forest_dataset.select('treecover2000').clip(aoi)
+forest_loss_year = forest_dataset.select('lossyear').clip(aoi)
+recent_deforestation = forest_loss_year.gte(19).And(forest_loss_year.lte(23)).selfMask()
+print("✓ Forest data loaded (2019-2023 deforestation)")
+
+# 4. SENTINEL-2 (sediment analysis)
+print("🛰️ Searching for Sentinel-2 imagery...")
+def get_sentinel2_composite(start, end, aoi):
+    try:
+        collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                     .filterBounds(aoi)
+                     .filterDate(start, end)
+                     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50)))
+
+        count = collection.size().getInfo()
+        if count == 0:
+            return None
+
+        composite = collection.median().clip(aoi)
+        bands = composite.bandNames().getInfo()
+        if len(bands) == 0:
+            return None
+
+        return composite
+    except Exception as e:
+        print(f"  ⚠ S2 error: {e}")
+        return None
+
+s2_pre = get_sentinel2_composite(
+    ee.Date(EVENT_START).advance(-60, 'day'),
+    ee.Date(EVENT_START).advance(-5, 'day'),
+    aoi
+)
+
+s2_post = get_sentinel2_composite(
+    ee.Date(EVENT_END),
+    ee.Date(POST_EVENT).advance(7, 'day'),
+    aoi
+)
+
+def calculate_turbidity(img):
+    if img is None:
+        return None
+    try:
+        return img.select('B4').divide(img.select('B3')).rename('turbidity')
+    except:
+        return None
+
+turbidity_pre = calculate_turbidity(s2_pre)
+turbidity_post = calculate_turbidity(s2_post)
+s2_available = (turbidity_pre is not None or turbidity_post is not None)
+
+if s2_available:
+    print("✓ Sentinel-2 available for sediment analysis")
+else:
+    print("⚠ Sentinel-2 unavailable (clouds/coverage)")
+
+# ===== RAINFALL ANALYSIS =====
+print("\n💧 Calculating rainfall accumulations...")
+def sum_hours(hours):
+    start = ee.Date(EVENT_START).advance(-hours, 'hour')
+    return (IMERG.filterDate(start, ee.Date(EVENT_START))
+            .select('precip')
+            .sum()
+            .multiply(0.5)
+            .rename(f'R{hours}h'))
+
+R6h = sum_hours(6)
+R24h = sum_hours(24)
+R72h = sum_hours(72)
+R192h = sum_hours(192)  # 8-day total
+
+API = ee.Image.cat([R6h, R24h, R72h]).expression(
+    '0.6*R6 + 0.3*R24 + 0.1*R72',
+    {'R6': R6h, 'R24': R24h, 'R72': R72h}
+).rename('API')
+
+print("✓ Rainfall indices calculated")
+
+# ===== SENTINEL-1 SAR =====
+print("📡 Searching for Sentinel-1 SAR...")
+def to_db(img):
+    return ee.Image(10).multiply(img.log10())
+
+def find_s1_images(aoi, date_start, date_end):
+    S1 = (ee.ImageCollection('COPERNICUS/S1_GRD')
+          .filterBounds(aoi)
+          .filter(ee.Filter.eq('instrumentMode','IW'))
+          .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VV')))
+
+    pre = None
+    for days_back in [30, 60, 90, 120]:
+        pre_coll = S1.filterDate(
+            ee.Date(date_start).advance(-days_back, 'day'),
+            ee.Date(date_start).advance(-5, 'day')
+        )
+        if pre_coll.size().getInfo() > 0:
+            pre = pre_coll.mosaic().select('VV')
+            break
+
+    if pre is None:
+        return None, None
+
+    for days_forward in [0, 15, 30, 45]:
+        post_coll = S1.filterDate(
+            date_start,
+            ee.Date(date_end).advance(days_forward, 'day')
+        )
+        if post_coll.size().getInfo() > 0:
+            post = post_coll.mosaic().select('VV')
+            return pre, post
+
+    return pre, None
+
+pre_vv, post_vv = find_s1_images(aoi, EVENT_START, EVENT_END)
+
+if pre_vv and post_vv:
+    pre_db = to_db(pre_vv).rename('VV_pre')
+    post_db = to_db(post_vv).rename('VV_post')
+    dVV = post_db.subtract(pre_db).rename('dVV')
+    sar_available = True
+    print("✓ Sentinel-1 SAR available for flood detection")
+else:
+    dVV = ee.Image.constant(0).rename('dVV').clip(aoi)
+    sar_available = False
+    print("⚠ Sentinel-1 unavailable - using proxy flood zones")
+
+# ===== HYDROLOGICAL RISK =====
+print("\n🌊 Computing hydrological risk factors...")
+
+runoff_risk = slope.multiply(0.4).add(
+    recent_deforestation.unmask(0).multiply(30)
+).add(
+    API.divide(10)
+).rename('runoff_risk')
+
+soil_saturation = API.subtract(elevation.divide(10)).rename('soil_saturation')
+
+erosion_risk = slope.multiply(
+    recent_deforestation.unmask(0).add(1)
+).rename('erosion_risk')
+
+print("✓ Risk indices computed")
+
+# ===== MAP CREATION =====
+def create_analysis_map(delta_db=1.5):
+    m = geemap.Map(center=aoi_info["center"], zoom=aoi_info["zoom"])
+
+    # Terrain base
+    m.addLayer(elevation, {
+        'min': 0, 'max': 1000,
+        'palette': ['#1a1a1a', '#2d5016', '#6b8e23', '#daa520', '#ffffff']
+    }, 'Elevation (Bukit Barisan)', False)
+
+    # RAINFALL
+    m.addLayer(R192h, {
+        'min': 0, 'max': 800,
+        'palette': ['#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#b10026']
+    }, '🌧️ Total Rainfall Nov 19-27 (mm)', True)
+
+    m.addLayer(API, {
+        'min': 0, 'max': 300,
+        'palette': ['#deebf7', '#9ecae1', '#4292c6', '#08519c', '#08306b']
+    }, 'Soil Saturation Index (API)', False)
+
+    # DEFORESTATION & EROSION
+    m.addLayer(recent_deforestation, {
+        'palette': ['#d62728']
+    }, '🌲 Recent Deforestation (2019-2023)', True)
+
+    m.addLayer(erosion_risk, {
+        'min': 0, 'max': 60,
+        'palette': ['#fee5d9', '#fcae91', '#fb6a4a', '#de2d26', '#a50f15']
+    }, 'Erosion Susceptibility', False)
+
+    # RUNOFF RISK
+    m.addLayer(runoff_risk, {
+        'min': 0, 'max': 100,
+        'palette': ['#fff7bc', '#fee391', '#fec44f', '#fe9929', '#d95f0e', '#993404']
+    }, '💧 Surface Runoff Risk', True)
+
+    m.addLayer(slope.gt(30).selfMask(), {
+        'palette': ['#ff4500']
+    }, 'Critical Slopes (>30°)', False)
+
+    # FLOOD DETECTION
+    if sar_available:
+        flood_mask = dVV.lt(-abs(delta_db)).selfMask().rename('flood')
+        m.addLayer(dVV, {
+            'min': -5, 'max': 5,
+            'palette': ['#08306b', '#2171b5', '#6baed6', '#bdd7e7', '#fee0d2', '#fc9272', '#de2d26']
+        }, 'SAR Backscatter Change (dVV)', False)
+
+        m.addLayer(flood_mask, {
+            'palette': ['#0000FF']
+        }, f'🌊 Flood Extent (dVV < {-abs(delta_db):.1f} dB)', True)
+    else:
+        proxy_flood = elevation.lt(50).And(API.gt(200)).selfMask()
+        m.addLayer(proxy_flood, {
+            'palette': ['#0066cc']
+        }, '🌊 Flood Risk Zones (low elev + high rain)', True)
+
+    # SEDIMENT
+    if s2_available and turbidity_post:
+        if turbidity_pre:
+            turbidity_change = turbidity_post.subtract(turbidity_pre)
+            layer_name = '🟤 Sediment Load Increase (Turbidity Δ)'
+        else:
+            turbidity_change = turbidity_post
+            layer_name = '🟤 Post-Flood Turbidity'
+
+        m.addLayer(turbidity_change, {
+            'min': 0, 'max': 2.0,
+            'palette': ['#fff7fb', '#ece2f0', '#d0d1e6', '#a6bddb', '#67a9cf', '#1c9099', '#016c59']
+        }, layer_name, True)
+
+    # RIVERS
+    river_features = []
+    for river_name, coords in aoi_info.get("rivers", {}).items():
+        river_line = ee.Geometry.LineString(coords)
+        river_features.append(ee.Feature(river_line, {'name': river_name}))
+
+    if river_features:
+        rivers_fc = ee.FeatureCollection(river_features)
+        m.addLayer(rivers_fc, {'color': '#1E90FF'}, '🏞️ Major Rivers', True)
+
+    # Upstream zone
+    upstream_outline = upstream_zone.bounds()
+    m.addLayer(ee.Image().paint(upstream_outline, 1, 2),
+               {'palette': 'red'},
+               '📍 Upstream Deforestation Zone (152ha)', False)
+
+    m.addLayerControl()
+    return m
+
+# ===== STATISTICS =====
+def calculate_statistics():
+    stats = {}
+
+    try:
+        deforest_area = recent_deforestation.multiply(ee.Image.pixelArea()).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=upstream_zone,
+            scale=30,
+            maxPixels=1e9
+        )
+        stats['deforestation_ha'] = deforest_area.getInfo().get('lossyear', 0) / 10000
+    except Exception as e:
+        print(f"Deforestation: {e}")
+        stats['deforestation_ha'] = 0
+
+    try:
+        avg_rainfall = R192h.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=aoi,
+            scale=1000,
+            maxPixels=1e9
+        )
+        stats['avg_rainfall_mm'] = avg_rainfall.getInfo().get('R192h', 0)
+    except Exception as e:
+        print(f"Rainfall: {e}")
+        stats['avg_rainfall_mm'] = 0
+
+    try:
+        if sar_available:
+            flood_area = dVV.lt(-1.5).multiply(ee.Image.pixelArea()).reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=aoi,
+                scale=30,
+                maxPixels=1e9
+            )
+            stats['flood_area_ha'] = flood_area.getInfo().get('dVV', 0) / 10000
+        else:
+            stats['flood_area_ha'] = 0
+    except Exception as e:
+        print(f"Flood area: {e}")
+        stats['flood_area_ha'] = 0
+
+    return stats
+
+# ===== DISPLAY =====
+display(HTML("""
+<div style='background:#1e3a5f;color:white;padding:20px;border-radius:8px;margin-bottom:20px;font-family:system-ui'>
+    <h2 style='margin:0 0 10px 0'>🌊 Padang City Flash Flood Analysis</h2>
+    <p style='margin:5px 0;opacity:0.9'><b>Event Period:</b> November 19-27, 2025</p>
+    <p style='margin:5px 0;opacity:0.9'><b>Rainfall:</b> 37 mm → 145 mm daily (770+ mm total)</p>
+    <p style='margin:5px 0;opacity:0.9'><b>Key Rivers:</b> Batang Kuranji (19.68 km) | Batang Aie Dingin (14.27 km)</p>
+    <p style='margin:5px 0;opacity:0.9'><b>Environmental Context:</b> 152 hectares upstream deforestation</p>
+</div>
+"""))
+
+delta_slider = widgets.FloatSlider(
+    value=1.5,
+    min=0.5,
+    max=3.0,
+    step=0.1,
+    description='Flood ΔdB:',
+    continuous_update=False,
+    style={'description_width': '100px'}
+)
+
+map_output = widgets.Output()
+
+def update_map(change):
+    with map_output:
+        map_output.clear_output(wait=True)
+        m = create_analysis_map(delta_slider.value)
+        display(m)
+
+delta_slider.observe(update_map, names='value')
+
+with map_output:
+    display(create_analysis_map(delta_slider.value))
+
+display(widgets.HBox([delta_slider]))
+display(map_output)
+
+# Statistics
+print("\n📊 Calculating statistics...")
+try:
+    stats = calculate_statistics()
+    display(HTML(f"""
+    <div style='background:#f0f4f8;padding:15px;border-radius:8px;margin-top:20px;font-family:system-ui'>
+        <h3 style='margin:0 0 10px 0;color:#1e3a5f'>📊 Quantitative Results</h3>
+        <table style='width:100%;border-collapse:collapse'>
+            <tr><td style='padding:8px;border-bottom:1px solid #ddd'><b>Upstream Deforestation (2019-2023)</b></td>
+                <td style='padding:8px;border-bottom:1px solid #ddd;text-align:right'>{stats.get('deforestation_ha', 0):.1f} ha</td></tr>
+            <tr><td style='padding:8px;border-bottom:1px solid #ddd'><b>Average Rainfall (8 days)</b></td>
+                <td style='padding:8px;border-bottom:1px solid #ddd;text-align:right'>{stats.get('avg_rainfall_mm', 0):.1f} mm</td></tr>
+            <tr><td style='padding:8px;border-bottom:1px solid #ddd'><b>Estimated Flood Area</b></td>
+                <td style='padding:8px;border-bottom:1px solid #ddd;text-align:right'>{stats.get('flood_area_ha', 0):.1f} ha</td></tr>
+        </table>
+        <p style='margin:15px 0 5px 0;font-size:0.9em;color:#666'>
+            <b>Key Findings:</b> Forest loss reduced infiltration capacity, increasing surface runoff.
+            Combined with 770+ mm rainfall, this triggered flash floods with high sediment loads
+            (brownish-yellow water observed 4 days post-event).
+        </p>
+    </div>
+    """))
+except Exception as e:
+    print(f"Statistics calculation: {e}")
+
+display(HTML("""
+<div style='background:#fff3cd;padding:15px;border-radius:8px;margin-top:20px;font-family:system-ui;border-left:4px solid #856404'>
+    <h4 style='margin:0 0 10px 0;color:#856404'>💡 Layer Interpretation</h4>
+    <ul style='margin:0;padding-left:20px;line-height:1.8'>
+        <li><b>Blue flood zones:</b> Standing water detected by SAR (reduced backscatter)</li>
+        <li><b>Red deforestation patches:</b> Forest loss → reduced infiltration → increased runoff</li>
+        <li><b>Yellow-orange runoff zones:</b> High-risk areas with rapid water flow</li>
+        <li><b>River lines (blue):</b> Flow paths from Bukit Barisan to Padang Beach</li>
+        <li><b>Brown turbidity:</b> Eroded soil carried downstream (coastal ecosystem stress)</li>
+    </ul>
+    <p style='margin:10px 0 0 0;font-size:0.9em;color:#856404'>
+        <b>Ecological Message:</b> "Pore network" saturation + deforestation = amplified disaster.
+        Forest restoration and soil health are critical for climate resilience.
+    </p>
+</div>
+"""))
+
+print("\n✅ Analysis complete! Use the slider to adjust flood detection sensitivity.")
+
+# Export map to HTML
+m = create_analysis_map(delta_slider.value)
+m.to_html('padang_flood_map.html')
+print("✅ Map exported to padang_flood_map.html")

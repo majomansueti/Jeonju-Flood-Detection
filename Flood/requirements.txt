@@ -1,0 +1,15 @@
+# Earth Engine and Geospatial
+earthengine-api
+geemap
+folium
+
+# Data manipulation and Widgets
+ipywidgets
+pandas
+numpy
+
+# Presentation Generation
+python-pptx
+
+# Geocoding
+geopy
