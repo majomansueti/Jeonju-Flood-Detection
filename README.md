@@ -20,12 +20,17 @@ By leveraging the free computing power of GEE and generating localized Anteceden
 
 ```
 .
-├── data/                  # GeoJSON polygons, Heritage Points, and tabular data
-├── docs/                  # KIICE Research Paper and Presentation Slides
-├── images/                # Output screenshots and supplementary maps
-├── notebooks/             # Original interactive analysis notebook
-├── requirements.txt       # Python dependencies
-└── README.md
+├── Flood/
+│   ├── images/                 # Output screenshots and supplementary maps
+│   └── requirements.txt        # Python dependencies
+│
+├── data/                       # Flood and heritage site datasets
+│   ├── Heritage Sites Flood Map Update.csv
+│   ├── Jeonju Flood Polygons.geojson
+│   └── jeonju_heritage_points.csv
+│
+├── Flood Map.txt               # Flood map generation script / notes
+└── README.md                   # Project documentation
 ```
 
 ## Setup Instructions
