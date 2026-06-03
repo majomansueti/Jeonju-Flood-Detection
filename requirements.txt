@@ -1,0 +1,11 @@
+# Jeonju Flood Detection — pinned dependencies
+# Tested on Python 3.10 + Google Colab
+
+earthengine-api==0.1.390
+geemap>=0.30,<0.40
+folium==0.15.1
+ipywidgets>=8.0,<9.0
+pandas>=2.0,<3.0
+numpy>=1.24,<2.0
+scikit-learn>=1.3,<2.0
+xgboost>=1.7,<3.0
