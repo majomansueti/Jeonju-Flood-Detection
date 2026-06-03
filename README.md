@@ -97,18 +97,6 @@ For applications requiring independent ground-truth validation
 the pipeline outputs (`risk_xgb`, `flood_polygons`) should be
 cross-referenced against authoritative sources.
 
-## Citation
-
-If you use this code, please cite:
-
-> López Mansueti, M. J. (2026). *Jeonju Flood Detection — Sentinel-1 SAR
-> and Google Earth Engine pipeline.* GitHub repository.
-> https://github.com/majomansueti/Jeonju-Flood-Detection
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
 ## Contact
 
 María José López Mansueti — majolopezmansueti@gmail.com
